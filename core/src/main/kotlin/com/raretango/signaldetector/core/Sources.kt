@@ -131,7 +131,66 @@ data class SimEmitter(
     val bearingDeg: Double,
     val toneHz: Double,
     val label: String,
+    /** Optional code the emitter sends (Morse, data bursts...). */
+    val keying: Keying? = null,
 )
+
+/** Ways a simulated emitter can carry code. */
+sealed class Keying {
+    /** 0 = carrier off, 1 = on. */
+    abstract fun gate(t: Double): Double
+    /** Modulating audio (-1..1) at time t. */
+    abstract fun audio(t: Double, toneHz: Double): Double
+
+    /** Morse. keyCarrier = CW (carrier on/off); otherwise a keyed tone in the audio (MCW). */
+    class Morse(text: String, wpm: Double, private val keyCarrier: Boolean, gapS: Double = 2.0) : Keying() {
+        private val units = MorseCode.encode(text)
+        private val dit = 1.2 / wpm
+        private val period = units.size * dit + gapS
+        private fun on(t: Double): Boolean { val i = ((t % period) / dit).toInt(); return i < units.size && units[i] }
+        override fun gate(t: Double) = if (!keyCarrier || on(t)) 1.0 else 0.0
+        override fun audio(t: Double, toneHz: Double) =
+            if (!keyCarrier && on(t)) 0.8 * sin(2 * PI * toneHz * t) else 0.0
+    }
+
+    /** On/off-keyed sensor bursts, pulse-width coded (1 = long pulse, 0 = short). */
+    class Ook(hex: String, private val unitS: Double = 0.0005, repeats: Int = 3, private val periodS: Double = 1.2) : Keying() {
+        private val units: BooleanArray = run {
+            val one = ArrayList<Boolean>()
+            for (c in hex) for (b in 3 downTo 0) {
+                val bit = (c.digitToInt(16) shr b) and 1 == 1
+                if (bit) { one += true; one += true; one += false } else { one += true; one += false; one += false }
+            }
+            val all = ArrayList<Boolean>()
+            repeat(repeats) { all += one; repeat(12) { all += false } }
+            all.toBooleanArray()
+        }
+        override fun gate(t: Double): Double { val i = ((t % periodS) / unitS).toInt(); return if (i < units.size && units[i]) 1.0 else 0.0 }
+        override fun audio(t: Double, toneHz: Double) = 0.0
+    }
+
+    /** A recorded audio clip (e.g. an APRS packet) sent every periodS. */
+    class Clip(private val clip: FloatArray, private val periodS: Double, private val rate: Int = AUDIO_RATE) : Keying() {
+        private fun idx(t: Double) = ((t % periodS) * rate).toInt()
+        override fun gate(t: Double) = if (idx(t) < clip.size) 1.0 else 0.0
+        override fun audio(t: Double, toneHz: Double): Double { val i = idx(t); return if (i < clip.size) clip[i].toDouble() else 0.0 }
+    }
+
+    /** Direct FSK data bursts: random symbols, 2 or 4 levels. */
+    class Fsk(private val baud: Double, private val levels: Int, private val burstS: Double, private val periodS: Double) : Keying() {
+        override fun gate(t: Double) = if (t % periodS < burstS) 1.0 else 0.0
+        override fun audio(t: Double, toneHz: Double): Double {
+            val sym = ((t % periodS) * baud).toLong() + (t / periodS).toLong() * 1_000_003L
+            // splitmix64 hash -> pseudo-random symbols
+            var h = sym + -0x61c8864680b583ebL
+            h = (h xor (h ushr 30)) * -0x40a7b892e31b1a47L
+            h = (h xor (h ushr 27)) * -0x6b2fb644ecceee15L
+            h = h xor (h ushr 31)
+            val v = (h ushr 40).toInt()
+            return if (levels == 4) listOf(-1.0, -1.0 / 3, 1.0 / 3, 1.0)[v and 3] else if (v and 1 == 1) 1.0 else -1.0
+        }
+    }
+}
 
 /**
  * Generates realistic test signals so the whole app can be tried without
@@ -179,17 +238,19 @@ class SimulatedSource(
                 amp *= Math.pow(10.0, gainDb / 20)
             }
             var ph = phases[e]
+            val k = em.keying
             for (i in 0 until n) {
                 val t = (sampleIndex + i) / fs
                 val env = 0.6 + 0.4 * sin(2 * PI * 2.5 * t)
-                val audio = env * sin(2 * PI * em.toneHz * t)
-                var a = amp
+                val gate = k?.gate(t) ?: 1.0
+                val audio = k?.audio(t, em.toneHz) ?: (env * sin(2 * PI * em.toneHz * t))
+                var a = amp * gate
                 val inst = when (em.mode) {
                     Mode.WFM -> { ph += 2 * PI * 50e3 * audio / fs; 0.0 }
                     Mode.NFM -> { ph += 2 * PI * 3e3 * audio / fs; 0.0 }
                     Mode.AM -> { a *= (1 + 0.7 * audio); 0.0 }
-                    Mode.USB -> { a *= 0.8 * env; 2 * PI * em.toneHz * t }
-                    Mode.LSB -> { a *= 0.8 * env; -2 * PI * em.toneHz * t }
+                    Mode.USB -> { if (k == null) a *= 0.8 * env; 2 * PI * em.toneHz * t }
+                    Mode.LSB -> { if (k == null) a *= 0.8 * env; -2 * PI * em.toneHz * t }
                     Mode.NONE -> 0.0
                 }
                 val total = ph + inst + 2 * PI * off * t
@@ -219,6 +280,20 @@ class SimulatedSource(
             SimEmitter(162.55e6, Mode.NFM, -32.0, 260.0, 1050.0, "Sim NOAA weather"),
             SimEmitter(462.5625e6, Mode.NFM, -42.0, 170.0, 900.0, "Sim FRS ch 1"),
             SimEmitter(851.0e6, Mode.NFM, -30.0, 20.0, 700.0, "Sim cellular (restricted)"),
+            // Signals carrying code, for trying the signal analyser:
+            SimEmitter(14.06e6, Mode.USB, -42.0, 90.0, 700.0, "Sim CW beacon",
+                Keying.Morse("CQ CQ DE SIM1 K", 18.0, keyCarrier = true)),
+            SimEmitter(146.4e6, Mode.NFM, -40.0, 140.0, 800.0, "Sim repeater Morse ID",
+                Keying.Morse("DE W1SIM R", 20.0, keyCarrier = false, gapS = 1.5)),
+            SimEmitter(433.92e6, Mode.AM, -35.0, 300.0, 0.0, "Sim weather sensor",
+                Keying.Ook("A5C3E19B2")),
+            SimEmitter(144.39e6, Mode.NFM, -38.0, 60.0, 0.0, "Sim APRS station",
+                Keying.Clip(AfskModulator.modulate(Ax25.encode("SIM1-9", "APRS", listOf("WIDE1-1"),
+                    "!4903.50N/07201.75W>Simulated APRS")), 4.0)),
+            SimEmitter(152.48e6, Mode.NFM, -40.0, 230.0, 0.0, "Sim telemetry (binary)",
+                Keying.Fsk(1200.0, 2, burstS = 3.5, periodS = 4.0)),
+            SimEmitter(155.7e6, Mode.NFM, -38.0, 330.0, 0.0, "Sim digital voice",
+                Keying.Fsk(4800.0, 4, burstS = 4.5, periodS = 5.0)),
         )
     }
 }

@@ -243,9 +243,18 @@ class RealDecimator(val factor: Int, cutoffHz: Double, inRate: Double, numTaps: 
 }
 
 /** Phase-continuous frequency shifter: moves a signal at [offsetHz] to 0 Hz. */
-class Nco(offsetHz: Double, sampleRate: Double) {
-    private val stepRe = cos(-2 * PI * offsetHz / sampleRate)
-    private val stepIm = sin(-2 * PI * offsetHz / sampleRate)
+class Nco(offsetHz: Double, private val sampleRate: Double) {
+    private var stepRe = cos(-2 * PI * offsetHz / sampleRate)
+    private var stepIm = sin(-2 * PI * offsetHz / sampleRate)
+    var offsetHz = offsetHz
+        private set
+
+    /** Retune without a phase jump (used for fine tuning / AFC). */
+    fun setOffset(hz: Double) {
+        if (hz == offsetHz) return
+        offsetHz = hz
+        stepRe = cos(-2 * PI * hz / sampleRate); stepIm = sin(-2 * PI * hz / sampleRate)
+    }
     private var pRe = 1.0
     private var pIm = 0.0
 
@@ -306,7 +315,21 @@ class Demodulator(
 ) {
     init { require(mode != Mode.NONE) { "no audio for data mode" } }
 
+    private val baseOffsetHz = offsetHz
     private val nco = Nco(offsetHz, sampleRate)
+
+    /** Manual fine tuning (clarifier / RIT), Hz. Can change while running. */
+    @Volatile var clarifierHz = 0.0
+    /** Automatic frequency control: follow a drifting FM/AM carrier. */
+    @Volatile var afcEnabled = false
+    /** Only let AFC move while a real signal is present. */
+    @Volatile var afcGate = true
+    /** Correction AFC has applied so far, Hz. */
+    var afcHz = 0.0
+        private set
+    /** Impulse-noise blanker (applied before the channel filter's final stage). */
+    val blanker = NoiseBlanker()
+    @Volatile var blankerEnabled = false
     private val d1 = max(1, (sampleRate / 256e3).toInt())
     private val rate1 = sampleRate / d1
     private val stage1 = ComplexDecimator(
@@ -337,13 +360,34 @@ class Demodulator(
     var levelDb = -150f
         private set
 
+    // Channel envelope (magnitude) at ~10 kHz, for spotting on/off keying.
+    private val envFactor = max(1, (ifRate / 10e3).toInt())
+    val envelopeRate = ifRate / envFactor
+    private var envAcc = 0f
+    private var envCount = 0
+
+    /** Channel envelope for the last block, at [envelopeRate]. */
+    var envelope = FloatArray(0)
+        private set
+
     fun process(iq: Iq): FloatArray {
+        if (!afcEnabled) afcHz = 0.0
+        nco.setOffset(baseOffsetHz + clarifierHz + afcHz)
         var x = stage1.process(nco.process(iq))
+        if (blankerEnabled) x = blanker.process(x)
         if (stage2 != null) x = stage2.process(x)
         if (x.size == 0) return FloatArray(0)
+        if (afcEnabled && afcGate && (mode == Mode.NFM || mode == Mode.WFM || mode == Mode.AM)) trackCarrier(x)
         var p = 0.0
         for (i in 0 until x.size) p += x.re[i] * x.re[i] + x.im[i] * x.im[i]
         levelDb = (10 * log10(p / x.size + 1e-20)).toFloat()
+        val env = FloatArray((envCount + x.size) / envFactor)
+        var e = 0
+        for (i in 0 until x.size) {
+            envAcc += sqrt(x.re[i] * x.re[i] + x.im[i] * x.im[i]); envCount++
+            if (envCount == envFactor) { env[e++] = envAcc / envFactor; envAcc = 0f; envCount = 0 }
+        }
+        envelope = env
 
         var audio = when (mode) {
             Mode.WFM, Mode.NFM -> fm(x)
@@ -356,6 +400,18 @@ class Demodulator(
         if (sq != null && levelDb < sq) audio.fill(0f)
         for (i in audio.indices) audio[i] = audio[i].coerceIn(-1f, 1f)
         return audio
+    }
+
+    /** Mean phase rotation per sample = how far the carrier is off centre. */
+    private fun trackCarrier(x: Iq) {
+        var sr = 0.0; var si = 0.0
+        for (i in 1 until x.size) {
+            val r = x.re[i]; val q = x.im[i]; val pr = x.re[i - 1]; val pq = x.im[i - 1]
+            sr += r * pr + q * pq; si += q * pr - r * pq
+        }
+        val errHz = atan2(si, sr) * ifRate / (2 * PI)
+        val limit = max(bw, 5e3)
+        afcHz = (afcHz + 0.5 * errHz).coerceIn(-limit, limit)
     }
 
     private fun fm(x: Iq): FloatArray {

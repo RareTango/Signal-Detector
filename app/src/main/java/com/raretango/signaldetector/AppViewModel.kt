@@ -16,6 +16,7 @@ import com.raretango.signaldetector.core.AprsPacket
 import com.raretango.signaldetector.core.Band
 import com.raretango.signaldetector.core.BandPlan
 import com.raretango.signaldetector.core.BearingSweep
+import com.raretango.signaldetector.core.Classification
 import com.raretango.signaldetector.core.KnownStation
 import com.raretango.signaldetector.core.KrakenDoa
 import com.raretango.signaldetector.core.LatLon
@@ -64,6 +65,13 @@ data class AppSettings(
     val krakenEnabled: Boolean = false,
     val krakenUrl: String = "http://krakensdr.local:8081/DOA_value.html",
     val krakenOffsetDeg: Float = 0f,
+    /** Look for Morse / binary data on the tuned channel. */
+    val analyze: Boolean = true,
+    val afc: Boolean = false,
+    val noiseBlanker: Boolean = false,
+    /** 0 = off .. 1 = strong */
+    val noiseReduction: Float = 0f,
+    val voiceFilter: Boolean = false,
 )
 
 data class Connection(val connected: Boolean = false, val connecting: Boolean = false, val status: String = "Not connected")
@@ -153,6 +161,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app), ReceiverListener {
     private val _fixes = MutableStateFlow<List<BearingFix>>(emptyList())
     val fixes = _fixes.asStateFlow()
 
+    private val _classification = MutableStateFlow<Classification?>(null)
+    val classification = _classification.asStateFlow()
+    /** Morse text decoded so far on this frequency (keeps growing while you listen). */
+    private val _morseLog = MutableStateFlow("")
+    val morseLog = _morseLog.asStateFlow()
+
+    private val _clarifier = MutableStateFlow(0.0)
+    val clarifierHz = _clarifier.asStateFlow()
+    /** Channel filter width; null = mode default. */
+    private val _filter = MutableStateFlow<Double?>(null)
+    val filterHz = _filter.asStateFlow()
+
     private val _scan = MutableStateFlow<ScanUi?>(null)
     val scan = _scan.asStateFlow()
 
@@ -199,6 +219,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app), ReceiverListener {
             krakenEnabled = prefs.getBoolean("kraken", false),
             krakenUrl = prefs.getString("krakenUrl", d.krakenUrl)!!,
             krakenOffsetDeg = prefs.getFloat("krakenOffset", 0f),
+            analyze = prefs.getBoolean("analyze", true),
+            afc = prefs.getBoolean("afc", false),
+            noiseBlanker = prefs.getBoolean("nb", false),
+            noiseReduction = prefs.getFloat("nr", 0f),
+            voiceFilter = prefs.getBoolean("voiceFilter", false),
         )
     }
 
@@ -213,6 +238,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app), ReceiverListener {
             .putFloat("volume", s.volume).putBoolean("upright", s.phoneUpright)
             .putString("antenna", s.antenna.name).putBoolean("kraken", s.krakenEnabled)
             .putString("krakenUrl", s.krakenUrl).putFloat("krakenOffset", s.krakenOffsetDeg)
+            .putBoolean("analyze", s.analyze).putBoolean("afc", s.afc).putBoolean("nb", s.noiseBlanker)
+            .putFloat("nr", s.noiseReduction).putBoolean("voiceFilter", s.voiceFilter)
             .apply()
         compass.upright = s.phoneUpright
         applyReceiverSettings()
@@ -224,6 +251,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app), ReceiverListener {
         val s = _settings.value
         receiver.thresholdDb = s.thresholdDb
         receiver.squelchDb = s.squelchDb
+        receiver.analyzeEnabled = s.analyze
+        receiver.afcEnabled = s.afc
+        receiver.blankerEnabled = s.noiseBlanker
+        receiver.noiseReduction = s.noiseReduction
+        receiver.voiceFilter = s.voiceFilter
         audio.setVolume(s.volume)
     }
 
@@ -271,8 +303,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app), ReceiverListener {
         val f = freqHz.coerceIn(100e3, 6e9)
         val m = mode ?: if (BandPlan.bandFor(f) != BandPlan.bandFor(_tuned.value)) BandPlan.defaultMode(f) else _mode.value
         _tuned.value = f
+        if (m != _mode.value) setFilter(null)
         _mode.value = m
         _audioBlocked.value = null
+        setClarifier(0.0)
+        _classification.value = null
+        _morseLog.value = ""
+
         prefs.edit().putFloat("tunedMhz", (f / 1e6).toFloat()).apply()
         receiver.tune(f, m)
         if (_sweep.value.active && kotlin.math.abs(_sweep.value.freqHz - f) > 5e3) stopSweep()
@@ -280,7 +317,40 @@ class AppViewModel(app: Application) : AndroidViewModel(app), ReceiverListener {
 
     fun tuneBand(b: Band) = tune(b.startHz + kotlin.math.min(b.widthHz / 2, 500e3), if (b.mode == Mode.NONE) null else b.mode)
 
-    fun setMode(m: Mode) { _mode.value = m; receiver.setMode(m) }
+    fun setMode(m: Mode) { _mode.value = m; setFilter(null); receiver.setMode(m) }
+
+    /** Fine tuning (clarifier): shifts the receiver by a few Hz..kHz without retuning. */
+    fun setClarifier(hz: Double) {
+        val v = hz.coerceIn(-5000.0, 5000.0)
+        _clarifier.value = v
+        receiver.clarifierHz = v
+    }
+
+    fun setFilter(hz: Double?) {
+        _filter.value = hz
+        receiver.bandwidthHz = hz
+    }
+
+    /** Re-centre on the strongest signal close to where you're tuned. */
+    fun snapToSignal(): Boolean {
+        val f = _spectrum.value ?: return false
+        val here = _tuned.value + _clarifier.value
+        val reach = maxOf(_mode.value.bandwidthHz * 1.5, 15e3)
+        val p = f.peaks.filter { kotlin.math.abs(it.freqHz - here) <= reach }.maxByOrNull { it.snrDb } ?: run {
+            _error.value = "No signal close to ${"%.4f".format(here / 1e6)} MHz to lock onto."
+            return false
+        }
+        val m = _mode.value
+        if (m == Mode.USB || m == Mode.LSB) {
+            // SSB has no carrier; move the clarifier so the voice band is centred.
+            setClarifier(p.freqHz - _tuned.value + (if (m == Mode.USB) -1500.0 else 1500.0))
+        } else {
+            val step = BandPlan.bandFor(p.freqHz)?.stepHz ?: 0.0
+            val snapped = if (step > 0) Math.round(p.freqHz / step) * step else p.freqHz
+            tune(if (kotlin.math.abs(snapped - p.freqHz) < step / 4) snapped else p.freqHz, m)
+        }
+        return true
+    }
 
     fun setListening(on: Boolean) {
         if (on) {
@@ -322,6 +392,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app), ReceiverListener {
     }
 
     override fun onAudio(samples: FloatArray) = audio.write(samples)
+
+    override fun onClassification(result: Classification) {
+        _classification.value = result
+        val t = result.text
+        if (result.kind == com.raretango.signaldetector.core.SignalKind.MORSE && t != null) {
+            // The decoder sees a sliding 15 s window; keep a running transcript.
+            _morseLog.update { log -> mergeTranscript(log, t) }
+        }
+    }
+
+    private fun mergeTranscript(log: String, window: String): String {
+        if (log.isEmpty()) return window
+        if (log.endsWith(window) || log.contains(window)) return log
+        // Find the longest overlap between the end of the log and the start of the window.
+        for (k in minOf(log.length, window.length) downTo 3) {
+            if (log.endsWith(window.substring(0, k))) return (log + window.substring(k)).takeLast(2000)
+        }
+        return (log + " " + window).takeLast(2000)
+    }
 
     override fun onAudioBlocked(reason: String) {
         _audioBlocked.value = reason

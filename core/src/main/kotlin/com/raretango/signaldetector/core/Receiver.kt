@@ -12,6 +12,8 @@ data class SpectrumFrame(
     val tunedHz: Double,
     /** Power in the tuned channel, dBFS (drives the signal meter and DF). */
     val channelDb: Float,
+    /** Correction applied by automatic frequency control, Hz. */
+    val afcHz: Double = 0.0,
 )
 
 data class ScanHit(val peak: Peak, val band: Band?, val known: KnownFrequency?)
@@ -22,6 +24,8 @@ interface ReceiverListener {
     fun onAudioBlocked(reason: String) {}
     fun onAprs(packet: AprsPacket) {}
     fun onAdsb(message: AdsbDecoder.Message) {}
+    /** About once a second: what kind of signal / code is on the tuned channel. */
+    fun onClassification(result: Classification) {}
     fun onScanProgress(band: Band, fraction: Float, hits: List<ScanHit>) {}
     fun onError(e: Throwable) {}
 }
@@ -40,6 +44,24 @@ class Receiver(private val listener: ReceiverListener) {
     @Volatile var squelchDb: Float? = null
     @Volatile var thresholdDb = 10f
     @Volatile var aprsEnabled = true
+    /** Analyse the tuned channel for Morse / binary data even when not listening. */
+    @Volatile var analyzeEnabled = true
+
+    // ---- clean-up controls (all take effect immediately, no retune) ----
+    /** Fine tuning / clarifier offset, Hz. */
+    @Volatile var clarifierHz = 0.0
+    /** Follow a drifting carrier automatically (FM/AM). */
+    @Volatile var afcEnabled = false
+    /** Impulse noise blanker. */
+    @Volatile var blankerEnabled = false
+    /** Channel filter width; null = the mode's default. Changing it rebuilds the filter. */
+    @Volatile var bandwidthHz: Double? = null
+    /** Spectral noise reduction 0 (off) .. 1 (strong). */
+    @Volatile var noiseReduction = 0f
+    /** 300-3000 Hz speech band-pass. */
+    @Volatile var voiceFilter = false
+    private var voice = VoiceFilter()
+    private val reducer = NoiseReducer(0f)
     @Volatile var fftSize = 2048
 
     @Volatile private var dirty = true
@@ -47,7 +69,10 @@ class Receiver(private val listener: ReceiverListener) {
     @Volatile private var scanBand: Band? = null
     private var thread: Thread? = null
     private var demod: Demodulator? = null
-    private var demodKey: Triple<Double, Double, Mode>? = null
+    private var demodKey: List<Any>? = null
+    private var classifier: SignalClassifier? = null
+    private var lastClassifyMs = 0L
+    private var lastSnrDb = 0f
     private var analyzer = SpectrumAnalyzer(fftSize)
     private val adsb = AdsbDecoder()
     private val afsk = AfskDemodulator { frame -> Ax25.decode(frame)?.let(listener::onAprs) }
@@ -107,14 +132,16 @@ class Receiver(private val listener: ReceiverListener) {
                 val psd = analyzer.compute(iq)
                 val floor = PeakFinder.noiseFloor(psd)
                 val peaks = PeakFinder.find(psd, src.centerHz, src.sampleRate, thresholdDb)
-                val chan = PeakFinder.channelPower(psd, src.centerHz, src.sampleRate, tunedHz, max(mode.bandwidthHz, 5e3))
-                listener.onSpectrum(SpectrumFrame(psd, src.centerHz, src.sampleRate, peaks, floor, tunedHz, chan))
+                val chan = PeakFinder.channelPower(psd, src.centerHz, src.sampleRate, tunedHz + clarifierHz + (demod?.afcHz ?: 0.0),
+                    max(bandwidthHz ?: mode.bandwidthHz, 5e3))
+                listener.onSpectrum(SpectrumFrame(psd, src.centerHz, src.sampleRate, peaks, floor, tunedHz, chan, demod?.afcHz ?: 0.0))
 
                 if (isAdsb()) {
                     adsb.process(iq).forEach(listener::onAdsb)
                     continue
                 }
-                if (listening || (aprsEnabled && isAprsFreq())) demodulate(src, iq)
+                lastSnrDb = chan - floor
+                if (listening || analyzeEnabled || (aprsEnabled && isAprsFreq())) demodulate(src, iq)
             }
         } catch (e: Throwable) {
             if (running) listener.onError(e)
@@ -129,18 +156,51 @@ class Receiver(private val listener: ReceiverListener) {
         val perm = BandPlan.audioPermission(tunedHz, mode.bandwidthHz)
         if (!perm.allowed || mode == Mode.NONE) {
             if (listening) listener.onAudioBlocked(perm.reason.ifEmpty { "No audio in data mode." })
+            maybeClassify {
+                Classification(SignalKind.NONE, 1f, "Content analysis is off here: " + perm.reason.ifEmpty { "data-only band." })
+            }
             return
         }
-        val key = Triple(tunedHz - src.centerHz, src.sampleRate, mode)
+        val bw = bandwidthHz ?: mode.bandwidthHz
+        val offset = tunedHz - src.centerHz
+        val key = listOf(offset, src.sampleRate, mode, bw)
         if (demod == null || demodKey != key) {
-            demod = Demodulator(mode, src.sampleRate, key.first)
+            val retuned = demodKey == null || demodKey!![0] != offset || demodKey!![2] != mode
+            demod = Demodulator(mode, src.sampleRate, offset, bw)
             demodKey = key
+            if (retuned) {
+                classifier = SignalClassifier(demod!!.envelopeRate)
+                voice = VoiceFilter()
+            }
         }
         val d = demod!!
-        d.squelchDb = squelchDb
-        val audio = d.process(iq)
+        d.clarifierHz = clarifierHz
+        d.afcEnabled = afcEnabled
+        d.afcGate = lastSnrDb > 8
+        d.blankerEnabled = blankerEnabled
+        val audio = d.process(iq) // unsquelched, so analysis still works while muted
         if (aprsEnabled && mode == Mode.NFM) afsk.process(audio)
-        if (listening) listener.onAudio(audio)
+        if (analyzeEnabled) {
+            val c = classifier!!
+            c.feed(d.envelope, audio)
+            maybeClassify { c.classify(lastSnrDb, tunedHz) }
+        }
+        if (listening) {
+            var out = audio
+            if (voiceFilter && mode != Mode.WFM) out = voice.process(out)
+            reducer.strength = noiseReduction
+            out = reducer.process(out)
+            val sq = squelchDb
+            listener.onAudio(if (sq != null && d.levelDb < sq) FloatArray(out.size) else out)
+        }
+    }
+
+    private inline fun maybeClassify(make: () -> Classification) {
+        val now = System.currentTimeMillis()
+        if (now - lastClassifyMs >= 1000) {
+            lastClassifyMs = now
+            listener.onClassification(make())
+        }
     }
 
     private fun scan(src: IqSource, band: Band) {

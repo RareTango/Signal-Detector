@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -65,6 +66,7 @@ import com.raretango.signaldetector.core.KnownFrequencies
 import com.raretango.signaldetector.core.KnownStation
 import com.raretango.signaldetector.core.LatLon
 import com.raretango.signaldetector.core.Mode
+import com.raretango.signaldetector.core.SignalKind
 import com.raretango.signaldetector.core.SourceLocator
 import com.raretango.signaldetector.core.UpdateState
 
@@ -164,6 +166,9 @@ fun ScannerScreen(vm: AppViewModel, onOpenSettings: () -> Unit) {
             if (!perm.allowed) Small("🔒 " + perm.reason, Danger)
             blocked?.let { Small("🔒 $it", Danger) }
         }
+
+        CleanupSection(vm)
+        CodesSection(vm)
 
         Section("Detected signals") {
             val peaks = frame?.peaks.orEmpty().sortedByDescending { it.snrDb }
@@ -599,5 +604,131 @@ fun SettingsScreen(vm: AppViewModel, onConnect: () -> Unit) {
                 "have different rules — check yours.")
         }
         Spacer(Modifier.height(16.dp))
+    }
+}
+
+// ------------------------------------------------- clean-up & code panels
+
+private fun filterChoices(m: Mode): List<Pair<String, Double>> = when (m) {
+    Mode.WFM -> listOf("Narrow 120k" to 120e3, "Normal 200k" to 200e3)
+    Mode.NFM -> listOf("6 kHz" to 6e3, "9 kHz" to 9e3, "12.5 kHz" to 12.5e3, "25 kHz" to 25e3)
+    Mode.AM -> listOf("4 kHz" to 4e3, "6 kHz" to 6e3, "10 kHz" to 10e3)
+    Mode.USB, Mode.LSB -> listOf("CW 500" to 500.0, "1.8 kHz" to 1.8e3, "2.4 kHz" to 2.4e3, "3 kHz" to 3e3)
+    Mode.NONE -> emptyList()
+}
+
+@Composable
+fun CleanupSection(vm: AppViewModel) {
+    val s by vm.settings.collectAsStateWithLifecycle()
+    val mode by vm.mode.collectAsStateWithLifecycle()
+    val clar by vm.clarifierHz.collectAsStateWithLifecycle()
+    val filter by vm.filterHz.collectAsStateWithLifecycle()
+    val frame by vm.spectrum.collectAsStateWithLifecycle()
+
+    Section("Clean up the signal") {
+        Small("Hiss means no usable signal on that exact spot. Lock onto it, narrow the filter, then remove noise.")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Button(onClick = { vm.snapToSignal() }) { Text("Lock onto signal") }
+            Switch(s.afc, { on -> vm.updateSettings { it.copy(afc = on) } })
+            Small("Auto-track (AFC)" + if (s.afc && frame != null && kotlin.math.abs(frame!!.afcHz) > 20) " %+.0f Hz".format(frame!!.afcHz) else "")
+        }
+
+        Small("Fine tune (clarifier): %+.0f Hz".format(clar) +
+            if (mode == Mode.USB || mode == Mode.LSB) "  — turn until voices sound natural, not like a duck" else "")
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            for (d in listOf(-1000.0, -100.0, -10.0)) OutlinedButton(onClick = { vm.setClarifier(clar + d) },
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp)) { Text("%+.0f".format(d), fontSize = 12.sp) }
+            for (d in listOf(10.0, 100.0, 1000.0)) OutlinedButton(onClick = { vm.setClarifier(clar + d) },
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 6.dp)) { Text("%+.0f".format(d), fontSize = 12.sp) }
+        }
+        Slider(clar.toFloat(), { vm.setClarifier(it.toDouble()) }, valueRange = -3000f..3000f)
+        if (clar != 0.0) TextButton(onClick = { vm.setClarifier(0.0) }) { Text("Reset fine tune") }
+
+        val choices = filterChoices(mode)
+        if (choices.isNotEmpty()) {
+            Small("Filter width (narrower = less noise, too narrow = muffled)")
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for ((label, hz) in choices) {
+                    val selected = (filter ?: mode.bandwidthHz) == hz
+                    FilterChip(selected = selected, onClick = { vm.setFilter(if (hz == mode.bandwidthHz) null else hz) }, label = { Text(label) })
+                }
+            }
+        }
+
+        Small("Noise reduction: " + when {
+            s.noiseReduction <= 0f -> "off"
+            s.noiseReduction < 0.4f -> "light"
+            s.noiseReduction < 0.75f -> "medium"
+            else -> "strong"
+        } + "  (keep off for Morse / data tones)")
+        Slider(s.noiseReduction, { v -> vm.updateSettings { it.copy(noiseReduction = v) } }, valueRange = 0f..1f)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Switch(s.voiceFilter, { on -> vm.updateSettings { it.copy(voiceFilter = on) } })
+            Spacer(Modifier.width(8.dp)); Small("Voice filter (cuts rumble & high hiss)")
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Switch(s.noiseBlanker, { on -> vm.updateSettings { it.copy(noiseBlanker = on) } })
+            Spacer(Modifier.width(8.dp)); Small("Noise blanker (removes clicks & pops: engines, power lines)")
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Switch(s.squelchDb != null, { on -> vm.updateSettings { it.copy(squelchDb = if (on) -60f else null) } })
+            Spacer(Modifier.width(8.dp)); Small("Squelch (silent until someone transmits)")
+        }
+        s.squelchDb?.let { q ->
+            frame?.let { Small("Squelch %.0f dB · signal now %.0f dB — set it just above the level with nobody talking".format(q, it.channelDb)) }
+            Slider(q, { v -> vm.updateSettings { it.copy(squelchDb = v) } }, valueRange = -110f..-10f)
+        }
+        Small("Still hissy? Better antenna (outdoors, high up, sized for the band), lower manual gain if strong stations distort, and set PPM correction in Settings if every signal sits slightly off-centre.")
+    }
+}
+
+@Composable
+fun CodesSection(vm: AppViewModel) {
+    val s by vm.settings.collectAsStateWithLifecycle()
+    val c by vm.classification.collectAsStateWithLifecycle()
+    val log by vm.morseLog.collectAsStateWithLifecycle()
+
+    Section("Hidden codes & data") {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Switch(s.analyze, { on -> vm.updateSettings { it.copy(analyze = on) } })
+            Spacer(Modifier.width(8.dp)); Small("Analyse this channel for Morse code and binary data")
+        }
+        val r = c
+        if (s.analyze && r == null) Small("Analysing… (give it a few seconds; Morse needs ~10 s)")
+        if (s.analyze && r != null) CodeResult(r, log)
+    }
+}
+
+@Composable
+private fun CodeResult(r: com.raretango.signaldetector.core.Classification, log: String) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        val color = when (r.kind) {
+            SignalKind.MORSE, SignalKind.OOK_DATA, SignalKind.AFSK_DATA, SignalKind.FSK_DATA -> Amber
+            SignalKind.DIGITAL_VOICE -> Accent
+            SignalKind.NONE -> Muted
+            else -> Good
+        }
+        Text(r.kind.label, color = color, fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
+        Small(r.summary, Color.White)
+        if (r.kind != SignalKind.NONE) Small("Confidence ${(r.confidence * 100).toInt()}%")
+        for (d in r.details) Small("• $d")
+        if (r.kind == SignalKind.MORSE) {
+            Small("Decoded text:")
+            SelectionContainer {
+                Text(log.ifEmpty { r.text ?: "" }, color = Color.White, fontFamily = FontFamily.Monospace, fontSize = 18.sp,
+                    modifier = Modifier.fillMaxWidth().background(Grid, RoundedCornerShape(8.dp)).padding(10.dp))
+            }
+            r.wpm?.let { Small("Speed %.0f words per minute".format(it)) }
+        }
+        r.bits?.let { bits ->
+            Small("Raw bits (binary):")
+            SelectionContainer {
+                Column(Modifier.fillMaxWidth().background(Grid, RoundedCornerShape(8.dp)).padding(10.dp)) {
+                    Text(bits, color = Color.White, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
+                    r.hex?.let { Text("hex: $it", color = Muted, fontFamily = FontFamily.Monospace, fontSize = 12.sp) }
+                }
+            }
+            r.baud?.let { Small("Rate ≈ %.0f bits per second".format(it)) }
+        }
     }
 }

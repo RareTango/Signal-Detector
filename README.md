@@ -9,6 +9,8 @@ identifies **who** is transmitting wherever the signal carries an ID.
 | Tab | Features |
 |---|---|
 | **Scanner** | Live spectrum and waterfall (tap to tune). Automatic signal detection with band/service labels. 37 built-in bands from longwave to 1.6 GHz, and "Scan" sweeps a whole band for active signals. **Listen** in WFM / NFM / AM / USB / LSB, with volume and squelch. |
+| **Clean up the signal** (Scanner) | **Lock onto signal** re-centres on the nearest transmission. **Auto-track (AFC)** follows drifting FM/AM carriers. **Fine-tune (clarifier)** ±3 kHz: the fix for SSB voices that sound like a duck. **Filter width** per mode. **Noise reduction** (spectral subtraction), **voice filter** (300–3000 Hz), **noise blanker** for clicks and pops, and squelch. |
+| **Hidden codes & data** (Scanner) | Analyses the tuned channel every second. **Morse code** is decoded to text with its WPM, whether the carrier is keyed (CW) or a tone is keyed in FM/AM (repeater IDs). **On/off-keyed bursts** from remotes and sensors are shown as raw **binary + hex**. **AFSK** tone pairs (APRS/packet, RTTY, Bell 103) are identified. A **direct FSK** bit stream is shown with its baud rate and raw bits (telemetry, AIS, paging). **Digital voice** (4-level FSK: DMR/P25/NXDN) is identified but never decoded. Steady tones (NOAA alert tone, EAS, test tones), carriers and plain voice are recognised too. |
 | **Direction** | Compass arrow pointing at the signal ("turn left 40°"). Rotate-and-listen sweep with a directional or loop antenna, shown as a polar plot. **KrakenSDR** support for instant bearings. **Triangulation** from two or more bearing fixes, with "Open in Maps". |
 | **Who** | **ADS-B** aircraft (callsign, ICAO ID, altitude, speed, bearing and distance from you). **APRS** ham stations (callsign and position, plus a "Who?" lookup on QRZ). Saved-station list (import/export CSV) matched by frequency and bearing, so it can tell you which known transmitter you're hearing. |
 | **Settings** | Receiver choice, gain, PPM, HF direct sampling, squelch, compass mode, legal notes, and **App updates**: the button shows the latest build number and who sent it, or "Current build" when you're up to date. |
@@ -17,7 +19,7 @@ identifies **who** is transmitting wherever the signal carries an ID.
 
 | You have | Use it as |
 |---|---|
-| Nothing | **Simulator**: fake stations. Turn the phone and the signal strength changes as if you held a directional antenna. |
+| Nothing | **Simulator**: fake stations. Turn the phone and the signal strength changes as if you held a directional antenna. Code samples: Morse beacon 14.060 (USB), Morse repeater ID 146.400, sensor bursts 433.920 (AM), APRS 144.390, binary telemetry 152.480, digital voice 155.700. |
 | RTL-SDR dongle (RTL-SDR Blog V4 recommended, ~$40) + USB-OTG adapter | **RTL-SDR on USB-OTG**. Install the free *RTL-SDR driver* app (Martin Marinov) from Google Play; Signal Detector opens it automatically. Covers 24 MHz to 1.766 GHz, and 0.5–28.8 MHz with "HF direct sampling" (V3/V4). |
 | Dongle on a PC or Raspberry Pi | **rtl_tcp over Wi-Fi**: run `rtl_tcp -a 0.0.0.0` and enter the host's IP. |
 | KrakenSDR | Turn on KrakenSDR in the Direction tab and point it at `http://<kraken-ip>:8081/DOA_value.html`. |
